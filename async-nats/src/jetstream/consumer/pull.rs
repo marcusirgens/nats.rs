@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, TryFutureExt};
 
 #[cfg(feature = "server_2_10")]
 use std::collections::HashMap;
@@ -124,6 +124,7 @@ impl Consumer<Config> {
         batch: I,
         inbox: String,
     ) -> Result<(), Error> {
+        debug!("sending batch");
         let subject = format!(
             "{}.CONSUMER.MSG.NEXT.{}.{}",
             self.context.prefix, self.info.stream_name, self.info.name
@@ -135,6 +136,8 @@ impl Consumer<Config> {
             .client
             .publish_with_reply(subject, inbox, payload.into())
             .await?;
+        self.context.client.flush().await?;
+        debug!("batch request sent");
         Ok(())
     }
 
@@ -284,6 +287,8 @@ pub struct Batch {
     pending_messages: usize,
     subscriber: Subscriber,
     context: Context,
+    timeout: Option<(tokio::sync::oneshot::Receiver<()>, JoinHandle<()>)>,
+    terminated: bool,
 }
 
 impl<'a> Batch {
@@ -292,10 +297,31 @@ impl<'a> Batch {
         let subscription = consumer.context.client.subscribe(inbox.clone()).await?;
         consumer.request_batch(batch, inbox.clone()).await?;
 
+        // This is a safeguard against deadlock in case of not receiving timeout from the server.
+        let timeout = {
+            if let Some(expire) = batch.expires {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let task_handle = tokio::task::spawn(async move {
+                    tokio::time::sleep(
+                        Duration::from_nanos(expire as u64).saturating_add(Duration::from_secs(5)),
+                    )
+                    .await;
+                    // It's safe to ignore the error, as it means that the iterator dropped
+                    // already.
+                    tx.send(()).ok();
+                });
+                Some((rx, task_handle))
+            } else {
+                None
+            }
+        };
+
         Ok(Batch {
             pending_messages: batch.batch,
             subscriber: subscription,
             context: consumer.context.clone(),
+            terminated: false,
+            timeout,
         })
     }
 }
@@ -307,32 +333,73 @@ impl futures::Stream for Batch {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        if self.pending_messages == 0 {
-            return std::task::Poll::Ready(None);
+        if self.terminated {
+            return Poll::Ready(None);
         }
-
+        if self.pending_messages == 0 {
+            self.terminated = true;
+            return Poll::Ready(None);
+        }
+        if let Some(timeout) = self.timeout.as_mut() {
+            match timeout.0.try_poll_unpin(cx) {
+                Poll::Ready(_) => {
+                    debug!("batch timeout timer triggered");
+                    // TODO(tp): protect against slow user - if
+                    // 1. we are consuming slowly
+                    // 2. server sent 10 more messages
+                    // 3. and queued timeout as 11
+                    //
+                    // by timing out without checking the queue, we could discard those 10 messages,
+                    // forcing redelivery.
+                    self.terminated = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => (),
+            }
+        }
         match self.subscriber.receiver.poll_recv(cx) {
-            Poll::Ready(maybe_message) => match maybe_message {
-                Some(message) => match message.status.unwrap_or(StatusCode::OK) {
-                    StatusCode::TIMEOUT => Poll::Ready(None),
-                    StatusCode::IDLE_HEARTBEAT => Poll::Pending,
-                    StatusCode::OK => {
-                        self.pending_messages -= 1;
-                        Poll::Ready(Some(Ok(jetstream::Message {
-                            context: self.context.clone(),
-                            message,
-                        })))
-                    }
-                    status => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "error while processing messages from the stream: {}, {:?}",
-                            status, message.description
-                        ),
-                    ))))),
-                },
-                None => Poll::Ready(None),
-            },
+            Poll::Ready(maybe_message) => {
+                trace!("received a message: {:?}", maybe_message);
+                match maybe_message {
+                    Some(message) => match message.status.unwrap_or(StatusCode::OK) {
+                        StatusCode::TIMEOUT => {
+                            debug!("recived timeout. Iterator done.");
+                            self.terminated = true;
+                            if let Some(timeout) = self.timeout.as_ref() {
+                                timeout.1.abort();
+                            }
+                            Poll::Ready(None)
+                        }
+                        StatusCode::IDLE_HEARTBEAT => {
+                            debug!("received heartbeat");
+                            Poll::Pending
+                        }
+                        StatusCode::OK => {
+                            debug!("receive message");
+                            self.pending_messages -= 1;
+                            Poll::Ready(Some(Ok(jetstream::Message {
+                                context: self.context.clone(),
+                                message,
+                            })))
+                        }
+                        status => {
+                            debug!("received error");
+                            self.terminated = true;
+                            if let Some(timeout) = self.timeout.as_ref() {
+                                timeout.1.abort();
+                            }
+                            Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!(
+                                    "error while processing messages from the stream: {}, {:?}",
+                                    status, message.description
+                                ),
+                            )))))
+                        }
+                    },
+                    None => Poll::Ready(None),
+                }
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -369,10 +436,13 @@ impl<'a> futures::Stream for Sequence<'a> {
                         .publish_with_reply(subject, inbox, request)
                         .await?;
 
+                    // TODO(tp): Add timeout config and defaults.
                     Ok(Batch {
                         pending_messages,
                         subscriber,
                         context,
+                        terminated: false,
+                        timeout: None,
                     })
                 }));
 

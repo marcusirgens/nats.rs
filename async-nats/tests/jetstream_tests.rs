@@ -1794,8 +1794,10 @@ mod jetstream {
         }
         assert_eq!(i, 10);
     }
+
     #[tokio::test]
     async fn pull_batch() {
+        tracing_subscriber::fmt::init();
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = ConnectOptions::new()
             .event_callback(|err| async move { println!("error: {err:?}") })
@@ -1803,7 +1805,7 @@ mod jetstream {
             .await
             .unwrap();
 
-        let context = async_nats::jetstream::new(client);
+        let context = async_nats::jetstream::new(client.clone());
 
         context
             .create_stream(stream::Config {
@@ -1815,38 +1817,60 @@ mod jetstream {
             .unwrap();
 
         let stream = context.get_stream("events").await.unwrap();
-        stream
+        let consumer = stream
             .create_consumer(consumer::pull::Config {
                 durable_name: Some("pull".to_string()),
+                ack_policy: AckPolicy::Explicit,
+                max_ack_pending: 10000,
                 ..Default::default()
             })
             .await
             .unwrap();
-        let consumer: PullConsumer = stream.get_consumer("pull").await.unwrap();
 
-        for _ in 0..100 {
-            context
-                .publish("events".to_string(), "dat".into())
+        let num_messages = 1000;
+        let handle = tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            for i in 0..=num_messages {
+                context
+                    .publish("events".to_string(), i.to_string().into())
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+                interval.tick().await;
+            }
+        });
+
+        let mut received = 0;
+        loop {
+            let mut iter = consumer
+                .batch()
+                .expires(Duration::from_millis(200))
+                .max_messages(200)
+                .messages()
                 .await
                 .unwrap();
-        }
-
-        let mut iter = consumer
-            .batch()
-            .max_messages(100)
-            .expires(Duration::from_millis(500))
-            .messages()
-            .await
-            .unwrap();
-
-        let mut i = 0;
-        while (iter.next().await).is_some() {
-            i += 1;
-            if i >= 100 {
-                return;
+            while let Some(message) = iter.next().await {
+                match message {
+                    Ok(message) => {
+                        if received == num_messages {
+                            handle.abort();
+                            return;
+                        }
+                        received += 1;
+                        message.ack().await.unwrap()
+                    }
+                    Err(err) => {
+                        assert_eq!(
+                            std::io::ErrorKind::TimedOut,
+                            err.downcast::<std::io::Error>().unwrap().kind()
+                        )
+                    }
+                }
             }
         }
     }
+
     #[tokio::test]
     async fn pull_consumer_stream_without_heartbeat() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
